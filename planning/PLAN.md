@@ -454,3 +454,59 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes
+
+### Questions & Clarifications Needed
+
+**Daily change %** — Decision: behaviour differs by data source.
+- **Massive API**: use the real daily change % from the API response (current price vs previous close). The Massive API provides this field natively.
+- **Simulator**: show change since page load, using the first SSE price received for each ticker as the baseline. Label the column "Change" (not "Daily Change") in simulator mode so users aren't misled.
+
+The backend should include a `change_pct` field and a `change_label` field (e.g., `"Daily"` vs `"Session"`) in the SSE payload and `/api/watchlist` response so the frontend can display the label correctly without knowing which data source is active.
+
+**Chat history window** — Section 9 says the backend loads "recent conversation history" but doesn't cap it. A very long session could overflow the LLM's context window. Should specify a hard limit (e.g., last 20 messages) to bound cost and latency.
+
+**SSE scope** — The SSE endpoint says it pushes "all tickers known to the system." Does this include positions for tickers that have been removed from the watchlist? If a user removes AAPL from the watchlist but still holds shares, does AAPL still stream? The frontend needs prices for all held positions to compute live P&L, so this should be explicit.
+
+**New ticker in simulator** — If a user adds a ticker to the watchlist that the simulator has no seed price for (e.g., `"XYZ"`), what happens? Does the simulator assign a random starting price, return an error, or silently skip it?
+
+**`actions` JSON shape in `chat_messages`** — The plan shows the LLM's output schema, but doesn't specify what gets persisted in the `actions` column. Is it the raw LLM output (requested actions) or the result of execution (including success/failure per trade)? The frontend needs to know what to render inline.
+
+**Massive API failure mode** — If `MASSIVE_API_KEY` is set but the Massive API is unreachable, should the backend fall back to the simulator, log and retry, or surface an error? Unspecified.
+
+**Initial portfolio snapshot** — Snapshots are taken every 30 seconds. On a fresh session the P&L chart could be empty for up to 30 seconds. Should a snapshot be taken at startup (or first request)?
+
+**`POST /api/watchlist` duplicate handling** — If the user (or LLM) adds a ticker already in the watchlist, should the endpoint return 200 (idempotent), 409 (conflict), or something else?
+
+**Mock LLM response shape** — `LLM_MOCK=true` is described as returning "deterministic" responses, but the exact content is unspecified. The backend implementer and test author need to agree on what message, trades, and watchlist_changes the mock returns so E2E assertions can be written.
+
+---
+
+### Simplification Opportunities
+
+**UUID primary keys on `watchlist` and `positions`** — Both tables already have a `UNIQUE (user_id, ticker)` constraint that serves as a natural composite key. The separate UUID `id` column is unused by any described endpoint and only adds overhead on inserts. Using the composite key as the PK removes the need to generate UUIDs for two tables.
+
+**`portfolio_snapshots` background task** — A dedicated 30-second polling task is one more moving part. Since a snapshot is already taken after every trade, the P&L chart will have data at all meaningful moments. A simpler alternative: snapshot on every trade only, plus once on startup. The chart resolution matches user activity rather than a wall-clock tick.
+
+**Recharts vs. Lightweight Charts** — Section 10 says "Canvas-based charting library preferred" but then lists Recharts as an option. Recharts renders SVG, not canvas — it will struggle with high-frequency SSE updates on the main chart. Pick one: Lightweight Charts for the performance-sensitive main chart, Recharts only if a React-integrated SVG chart is acceptable for the P&L/heatmap panels.
+
+**E2E test containerization** — The plan specifies a `docker-compose.test.yml` that runs Playwright inside its own container. For a course project, running Playwright locally against a Docker app is the standard pattern and avoids the added complexity of a multi-container test setup. The containerized Playwright approach is valuable for pure CI environments but adds a setup hurdle for students running tests locally.
+
+**`users_profile` table name** — The plural-but-singular name is unconventional. `user_profile` (singular) or `users` better matches SQL naming norms and reduces the chance of a typo in queries.
+
+---
+
+### Potential Issues
+
+**Price continuity across restarts** — The in-memory price cache is initialized from seed prices on every startup. If a user buys AAPL at the simulated price of $192 and then the container restarts, AAPL resets to ~$190 again. Positions will show incorrect unrealized P&L until prices drift back. Consider seeding the simulator from the last-known price stored in the DB (or a dedicated `prices` table), so portfolio math stays consistent across restarts.
+
+**Simulator realism for `daily change %`** — If daily change % is shown (see question above), the simulator's GBM random walk has no anchor for "yesterday's close." Without this, the displayed percentage will mean different things depending on when the user loaded the page, which could confuse users who expect Bloomberg-style daily % moves.
+
+**`cerebras-inference` skill dependency** — Section 9 references a `cerebras-inference` skill as if it is a known, available tool, but it is not defined anywhere in this document. Agents implementing the LLM integration need the skill to be defined (or the integration steps spelled out inline) before they can proceed.
+
+**Model ID stability** — The model `openrouter/openai/gpt-oss-120b` is a specific identifier that can change if OpenRouter updates its model catalog. Consider making this an environment variable (`LLM_MODEL`) with a documented default so it can be updated without a code change.
+
+**SSE and auth headers** — `EventSource` (the browser API) does not support custom headers. This is fine today since there is no auth, but it is worth noting as a constraint if authentication is ever added. The connection status indicator should distinguish "connecting" from "connected" so users know SSE is working during the initial handshake.
